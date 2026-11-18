@@ -1,0 +1,64 @@
+{
+  "master": {
+    "id": "WB-M500",
+    "title": "多段并单样本 · 主单",
+    "hops": [
+      {
+        "id": "HM-1",
+        "event_ts": "2026-11-17T08:00:00Z",
+        "location_code": "SHA-HUB",
+        "event_code": "PICKED",
+        "seq": 1
+      },
+      {
+        "id": "HM-3",
+        "event_ts": "2026-11-17T14:00:00Z",
+        "location_code": "NJ-HUB",
+        "event_code": "ARRIVED_HUB",
+        "seq": 3
+      }
+    ]
+  },
+  "members": [
+    {
+      "id": "WB-M501",
+      "title": "多段并单样本 · 成员段一",
+      "hops": [
+        {
+          "id": "L1-1",
+          "event_ts": "2026-11-17T09:30:00Z",
+          "location_code": "SHA-SORT",
+          "event_code": "IN_TRANSIT",
+          "seq": 1
+        },
+        {
+          "id": "L1-2",
+          "event_ts": "2026-11-17T11:00:00Z",
+          "location_code": "NJ-SORT",
+          "event_code": "IN_TRANSIT",
+          "seq": 2
+        }
+      ]
+    },
+    {
+      "id": "WB-M502",
+      "title": "多段并单样本 · 成员段二",
+      "hops": [
+        {
+          "id": "L2-1",
+          "event_ts": "2026-11-17T16:30:00Z",
+          "location_code": "HZ-SORT",
+          "event_code": "OUT_FOR_DELIVERY",
+          "seq": 1
+        },
+        {
+          "id": "L2-2",
+          "event_ts": "2026-11-17T18:00:00Z",
+          "location_code": "HZ-HOME",
+          "event_code": "DELIVERED",
+          "seq": 2
+        }
+      ]
+    }
+  ]
+}
