@@ -51,7 +51,14 @@ def snapshot(conn, waybill_id: str) -> dict:
 
 
 def recompute(conn, waybill_id: str, *, write_proof: bool = True) -> dict:
-    """按 (event_ts, id) 末点重算投影；调用方负责事务。"""
+    """按 (event_ts, id) 末点重算投影；调用方负责事务。
+
+    前置闸：已并入主单的成员段是冻结快照，不得再经自身键独立重算投影，
+    否则成员状态会与主单投影源证明分叉。
+    """
+    from app.modules.merge_leg_proof import assert_member_gate_open
+
+    assert_member_gate_open(conn, waybill_id)
     before = snapshot(conn, waybill_id)
     last = last_valid_hop(conn, waybill_id)
     status = map_status(last["event_code"]) if last else "未知"
@@ -79,16 +86,3 @@ def recompute(conn, waybill_id: str, *, write_proof: bool = True) -> dict:
         "mapped_code": last["event_code"] if last else None,
     }
     return {"before": before, "after": after}
-
-
-def _bridge_member_to_master(conn, waybill_id: str, value: str) -> None:
-    try:
-        from app.modules.merge_leg_proof import apply_member_ingest_to_master
-        row = conn.execute(
-            "SELECT master_id FROM merge_edges WHERE member_id=? ORDER BY rowid DESC LIMIT 1",
-            (waybill_id,),
-        ).fetchone()
-        if row:
-            apply_member_ingest_to_master(conn, waybill_id, row["master_id"], value)
-    except Exception:
-        pass

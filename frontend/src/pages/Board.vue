@@ -112,6 +112,8 @@ const mergedCount = computed(() => merge.value?.merged_count ?? 0)
             <dt>并入到</dt><dd>{{ merge.merged_into }}</dd>
             <dt>并入点</dt><dd>{{ merge.merged_count }}</dd>
             <dt>批次</dt><dd>{{ merge.batch_id || '—' }}</dd>
+            <dt>独立投影写口</dt>
+            <dd>{{ merge.gate_state === 'closed' ? '已关闸（不再改主单投影）' : '开放' }}</dd>
           </dl>
           <ul class="member-list" v-if="merge.role === 'master' && merge.members?.length">
             <li v-for="m in merge.members" :key="m.id">

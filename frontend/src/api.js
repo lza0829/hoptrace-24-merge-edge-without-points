@@ -29,4 +29,10 @@ export const api = {
     req(`/api/merge/fixture?mode=${encodeURIComponent(mode)}`, { method: 'POST' }),
   mergeBatches: () => req('/api/merge/batches'),
   mergeBatch: (batchId) => req(`/api/merge/batches/${encodeURIComponent(batchId)}`),
+  mergeMemberGates: (masterId) =>
+    req(masterId
+      ? `/api/merge/member-gates?master_id=${encodeURIComponent(masterId)}`
+      : '/api/merge/member-gates'),
+  mergeMemberGate: (memberId) =>
+    req(`/api/merge/member-gates/${encodeURIComponent(memberId)}`),
 }

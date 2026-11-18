@@ -88,6 +88,28 @@ CREATE TABLE IF NOT EXISTS merge_hops (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_hops_batch ON merge_hops(batch_id);
 CREATE INDEX IF NOT EXISTS idx_merge_hops_hop ON merge_hops(hop_id);
+
+-- 成员关闸证明：并段成功同事务关闭成员独立投影写口。
+-- 本表是「成员态」的唯一关闸凭据：member_id 唯一，关闸后成员不得再经自身键
+-- 写 status_proj / status_proofs，也不得把新点回流主单正式轴。
+-- frozen_* 记录关闸当时的成员快照；frozen_proof_id 记录关闸时成员最后一条状态证明，
+-- 之后任何更大的 status_proofs.id 都视为「独立投影写口被重新打开」。
+CREATE TABLE IF NOT EXISTS member_gate_proofs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL REFERENCES merge_batches(id),
+  master_id TEXT NOT NULL REFERENCES waybills(id),
+  member_id TEXT NOT NULL REFERENCES waybills(id),
+  gate_state TEXT NOT NULL,                 -- closed
+  frozen_hop_count INTEGER NOT NULL DEFAULT 0,
+  frozen_last_hop_id TEXT,
+  frozen_proj TEXT,
+  frozen_proof_id INTEGER NOT NULL DEFAULT 0,
+  master_proof_id INTEGER,
+  closed_at TEXT NOT NULL,
+  UNIQUE(member_id)                         -- 一个成员段只允许一次关闸
+);
+CREATE INDEX IF NOT EXISTS idx_member_gate_master ON member_gate_proofs(master_id);
+CREATE INDEX IF NOT EXISTS idx_member_gate_batch ON member_gate_proofs(batch_id);
 """
 
 EVENT_STATUS = {
@@ -147,13 +169,19 @@ def _seed_fixtures(conn):
 
 
 def _refresh_projections(conn):
-    """与装载 / 合并共用同一投影口径，避免证明数字各算一套。"""
+    """与装载 / 合并共用同一投影口径，避免证明数字各算一套。
+
+    已并入 / 关闸的成员段是冻结快照，不参与全量重算（否则会重开独立投影写口）。
+    """
+    from app.modules.merge_leg_proof import master_of_member
     from app.services import projection as projection_svc
 
     ids = [
         r["id"] for r in conn.execute("SELECT id FROM waybills ORDER BY id").fetchall()
     ]
     for wid in ids:
+        if master_of_member(conn, wid):
+            continue
         projection_svc.recompute(conn, wid, write_proof=True)
 
 

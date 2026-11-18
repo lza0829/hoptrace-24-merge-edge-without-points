@@ -1,17 +1,25 @@
 """多段并单：把成员段正式有效点按 (event_ts, id) 并入主单正式时间线。
 
-落库形态（择一：独立合并边表）：
-- merge_edges   主单 ← 成员段的合并边，可查且成员唯一；
-- merge_batches 合并批次证明（成功 / 失败均留痕）；
-- merge_hops    并入点溯源：批次 → 成员源点 → 主单正式 hop。
+落库形态（择一：独立合并边表 + 成员关闸证明表）：
+- merge_edges        主单 ← 成员段的合并边，可查且成员唯一；
+- merge_batches      合并批次证明（成功 / 失败均留痕）；
+- merge_hops         并入点溯源：批次 → 成员源点 → 主单正式 hop；
+- member_gate_proofs 成员关闸证明：并段成功同事务关闭成员独立投影写口，
+                     记录关闸时的成员快照与冻结时的最后一条状态证明。
 
 并入方式：成员段每个正式有效点复制为主单名下的 hops 行（新 id，保留源 id 溯源），
 因此主单时间线 / 末点投影天然来自同一张 hops 表，不会出现「边可查但时间线半截」。
 成员行落 merged_into 后，其后续点位不会再回流主单（并入的是不可变快照）。
 
-一致性路径（择一：同事务失败闭）：
-一次事务内完成「并入点 + 写边 + 标记成员 + 重算投影」，任一步异常整笔 ROLLBACK；
-失败尝试另落一条 rolled_back 批次供审计，但边、并入点、投影零残留。
+一致性路径（择一：并段成功同事务关闭成员独立投影写口并重算主单投影）：
+一次事务内完成「并入点 + 写边 + 标记成员 + 关成员闸 + 重算主单投影」，
+任一步异常整笔 ROLLBACK；失败尝试另落一条 rolled_back 批次供审计，
+但边、并入点、关闸证明、投影零残留。
+
+硬约束：
+- 成员段装载不得改主单投影；
+- 已并入标记可见后，成员不得再作为独立有效轴改投影（关闸后投影写口拒绝）；
+- 主单投影源证明与成员状态不得分叉（由 member_gate_verification 核证）。
 """
 
 from __future__ import annotations
@@ -32,6 +40,16 @@ class MergeError(Exception):
 
 class MergeFault(Exception):
     """事务中途注入的故障，用于验证失败闭。"""
+
+
+class MemberGateClosed(Exception):
+    """成员段关闸后仍试图经成员键独立写投影 / 正式轴。"""
+
+    def __init__(self, member_id: str, master_id: str | None = None):
+        self.member_id = member_id
+        self.master_id = master_id
+        where = f"已并入 {master_id}" if master_id else "已关闸"
+        super().__init__(f"成员段 {member_id} {where}，不得再独立写投影")
 
 
 # ---------------------------------------------------------------- helpers
@@ -155,6 +173,85 @@ def _assert_no_duplicate_points(conn, master_id: str, points: list[dict]) -> Non
         raise MergeError("并入点撞唯一约束，" + "；".join(bits))
 
 
+# ---------------------------------------------------------------- member gate
+
+
+def member_gate(conn, member_id: str):
+    """读取成员关闸证明行；未关闸返回 None。只读。"""
+    return conn.execute(
+        "SELECT * FROM member_gate_proofs WHERE member_id=?", (member_id,)
+    ).fetchone()
+
+
+def master_of_member(conn, member_id: str) -> str | None:
+    """成员段的合并归属：先看关闸证明，再退回合并边；未并入返回 None。"""
+    gate = member_gate(conn, member_id)
+    if gate:
+        return gate["master_id"]
+    edge = conn.execute(
+        "SELECT master_id FROM merge_edges WHERE member_id=?", (member_id,)
+    ).fetchone()
+    return edge["master_id"] if edge else None
+
+
+def assert_member_gate_open(conn, member_id: str) -> None:
+    """独立投影写口的前置闸：成员已并入 / 已关闸则拒绝写入。
+
+    装载 / 投影只允许改「自身仍是独立有效轴」的运单。已并入标记可见后，
+    成员段不得再经自己的键改主单投影，也不得把新点回流主单正式轴。
+    """
+    master_id = master_of_member(conn, member_id)
+    if master_id:
+        raise MemberGateClosed(member_id, master_id)
+
+
+def _latest_proof_id(conn, waybill_id: str) -> int:
+    row = conn.execute(
+        "SELECT MAX(id) AS pid FROM status_proofs WHERE waybill_id=?", (waybill_id,)
+    ).fetchone()
+    return int(row["pid"] or 0)
+
+
+def _close_member_gate(conn, batch_id: str, master_id: str, member_id: str, closed_at: str) -> None:
+    """并段成功同事务关闭成员独立投影写口。
+
+    关闸时冻结成员快照（点位数 / 末点 / 投影值 / 最后证明 id），此后成员行
+    既不再有可用的独立投影写口，其状态由本证明固定，供核证接口比对。
+    """
+    hops = conn.execute(
+        """
+        SELECT id, event_ts, event_code FROM hops
+        WHERE waybill_id=? AND channel='primary' AND retracted=0
+        ORDER BY event_ts DESC, id DESC
+        """,
+        (member_id,),
+    ).fetchall()
+    wb = conn.execute(
+        "SELECT status_proj FROM waybills WHERE id=?", (member_id,)
+    ).fetchone()
+    last = hops[0] if hops else None
+    conn.execute(
+        """
+        INSERT INTO member_gate_proofs(batch_id, master_id, member_id, gate_state,
+                                       frozen_hop_count, frozen_last_hop_id, frozen_proj,
+                                       frozen_proof_id, master_proof_id, closed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            batch_id,
+            master_id,
+            member_id,
+            "closed",
+            len(hops),
+            last["id"] if last else None,
+            wb["status_proj"] if wb else None,
+            _latest_proof_id(conn, member_id),
+            _latest_proof_id(conn, master_id),
+            closed_at,
+        ),
+    )
+
+
 # ---------------------------------------------------------------- read models
 
 
@@ -180,12 +277,15 @@ def batch_proof(conn, batch_id: str) -> dict | None:
         wb = conn.execute(
             "SELECT id, title, merged_into FROM waybills WHERE id=?", (mid,)
         ).fetchone()
+        gate = member_gate(conn, mid) if row["status"] == "committed" else None
         members.append(
             {
                 "id": mid,
                 "title": wb["title"] if wb else None,
                 "merged_into": wb["merged_into"] if wb else None,
                 "merged_count": edges[mid]["merged_count"] if mid in edges else 0,
+                "gate_state": gate["gate_state"] if gate else "open",
+                "gate_proof": _gate_row_dict(gate) if gate else None,
             }
         )
     hop_ids = [
@@ -212,6 +312,106 @@ def batch_proof(conn, batch_id: str) -> dict | None:
         "projection_after": json.loads(row["proj_after_json"] or "{}"),
         "created_at": row["created_at"],
     }
+
+
+def _gate_row_dict(row) -> dict:
+    return {
+        "member_id": row["member_id"],
+        "master_id": row["master_id"],
+        "batch_id": row["batch_id"],
+        "gate_state": row["gate_state"],
+        "frozen_hop_count": row["frozen_hop_count"],
+        "frozen_last_hop_id": row["frozen_last_hop_id"],
+        "frozen_proj": row["frozen_proj"],
+        "frozen_proof_id": row["frozen_proof_id"],
+        "master_proof_id": row["master_proof_id"],
+        "closed_at": row["closed_at"],
+    }
+
+
+def verify_member_gate(conn, member_id: str) -> dict | None:
+    """成员关闸核证（只读）。
+
+    返回成员的关闸证明，并逐项核对关闸之后成员是否仍被独立写口改动：
+
+    - gate_closed        关闸证明存在且 gate_state='closed'；
+    - projection_untorn  成员当前 status_proj 仍等于关闸冻结值（未被独立改动）；
+    - proof_untorn       关闸之后没有新的 status_proofs 行落在成员自身（独立写口未重开）；
+    - hops_untorn        成员正式轴规模仍等于关闸冻结值（无新点回流）；
+    - merged_into_matches 成员行 merged_into 与关闸记录的主单一致；
+    - master_projection_from_timeline
+                         主单投影仍与主单正式轴末点同源（未与成员状态分叉）。
+
+    任一不成立则 ok=False，供并段页 / 证明页与装载闸统一回查。
+    """
+    gate = member_gate(conn, member_id)
+    if not gate:
+        return None
+    master_id = gate["master_id"]
+    wb = conn.execute(
+        "SELECT merged_into, status_proj FROM waybills WHERE id=?", (member_id,)
+    ).fetchone()
+    hop_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM hops
+        WHERE waybill_id=? AND channel='primary' AND retracted=0
+        """,
+        (member_id,),
+    ).fetchone()["c"]
+    latest_member_proof = _latest_proof_id(conn, member_id)
+
+    checks = {
+        "gate_closed": gate["gate_state"] == "closed",
+        "projection_untorn": (wb["status_proj"] if wb else None) == gate["frozen_proj"],
+        "proof_untorn": latest_member_proof <= gate["frozen_proof_id"],
+        "hops_untorn": hop_count == gate["frozen_hop_count"],
+        "merged_into_matches": (wb["merged_into"] if wb else None) == master_id,
+    }
+
+    # 主单投影源：主单正式轴末点映射值，与成员状态彻底解耦。
+    master_last = conn.execute(
+        """
+        SELECT id, event_code FROM hops
+        WHERE waybill_id=? AND channel='primary' AND retracted=0
+        ORDER BY event_ts DESC, id DESC LIMIT 1
+        """,
+        (master_id,),
+    ).fetchone()
+    master_wb = conn.execute(
+        "SELECT status_proj FROM waybills WHERE id=?", (master_id,)
+    ).fetchone()
+    from app.services.projection import map_status
+
+    expected_master_proj = map_status(master_last["event_code"]) if master_last else "未知"
+    checks["master_projection_from_timeline"] = (
+        (master_wb["status_proj"] if master_wb else None) == expected_master_proj
+    )
+
+    return {
+        "member_id": member_id,
+        "master_id": master_id,
+        "gate": _gate_row_dict(gate),
+        "checks": checks,
+        "ok": all(checks.values()),
+        "member_timeline_owner": master_id,
+        "master_last_hop_id": master_last["id"] if master_last else None,
+        "master_status_proj": master_wb["status_proj"] if master_wb else None,
+        "expected_master_status_proj": expected_master_proj,
+    }
+
+
+def list_member_gates(conn, master_id: str | None = None, limit: int = 100) -> list[dict]:
+    """成员关闸证明列表（只读），可按主单过滤。"""
+    if master_id:
+        rows = conn.execute(
+            "SELECT * FROM member_gate_proofs WHERE master_id=? ORDER BY id DESC LIMIT ?",
+            (master_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM member_gate_proofs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [_gate_row_dict(r) for r in rows]
 
 
 def list_batches(conn, limit: int = 50) -> list[dict]:
@@ -245,12 +445,15 @@ def merge_summary(conn, waybill_id: str) -> dict | None:
             "SELECT batch_id, master_id, merged_count, created_at FROM merge_edges WHERE member_id=?",
             (waybill_id,),
         ).fetchone()
+        gate = member_gate(conn, waybill_id)
         return {
             "role": "member",
             "merged_into": wb["merged_into"],
             "merged_at": wb["merged_at"],
             "batch_id": edge["batch_id"] if edge else None,
             "merged_count": edge["merged_count"] if edge else 0,
+            "gate_state": gate["gate_state"] if gate else "open",
+            "gate_proof": _gate_row_dict(gate) if gate else None,
         }
     # 主单可多次并单：汇总全部合并边，数字仍从批次证明回查，不另算。
     edges = conn.execute(
@@ -377,13 +580,21 @@ def merge_legs(master_id: str, member_ids, *, fail_after: int | None = None) -> 
                 """,
                 (batch_id, master_id, mid, per_member[mid], created_at),
             )
+            # 同事务：标记成员已并入（可见的冻结标记）+ 关闭成员独立投影写口。
             conn.execute(
-                "UPDATE waybills SET merged_at=? WHERE id=?",
-                (created_at, mid),
+                "UPDATE waybills SET merged_into=?, merged_at=? WHERE id=?",
+                (master_id, created_at, mid),
             )
+            _close_member_gate(conn, batch_id, master_id, mid, created_at)
 
         proj = projection.recompute(conn, master_id, write_proof=True)
         total = sum(per_member.values())
+        # 回填主单投影源证明 id，证明「主单投影只由主单正式轴派生」。
+        master_proof_id = _latest_proof_id(conn, master_id)
+        conn.execute(
+            "UPDATE member_gate_proofs SET master_proof_id=? WHERE batch_id=?",
+            (master_proof_id, batch_id),
+        )
         conn.execute(
             """
             UPDATE merge_batches
@@ -476,6 +687,103 @@ def run_fixture(mode: str = "success", run_tag: str | None = None) -> dict:
     return proof
 
 
+def _post_merge_ingest_payload(tag: str, member_ids: list[str]) -> dict:
+    """按 member_ingest_after_merge.json 生成一次成员装载批次（id 带 run tag）。"""
+    from app.db import FIXTURES_DIR
+
+    path = FIXTURES_DIR / "member_ingest_after_merge.json"
+    if not path.exists():
+        raise MergeError("缺少 member_ingest_after_merge.json")
+    tpl = json.loads(path.read_text(encoding="utf-8"))
+    idx = int(tpl.get("member_index", 0))
+    if idx >= len(member_ids):
+        raise MergeError("member_index 越界：合并夹具成员不足")
+    target = member_ids[idx]
+    hops = []
+    for hop in tpl.get("hops", []):
+        hops.append(
+            {
+                **hop,
+                "id": f"{hop['id']}-{tag}",
+                "waybill_id": target,
+            }
+        )
+    return {
+        "batch_id": f"{tpl.get('batch_id_prefix', 'B-POSTMERGE')}-{tag}",
+        "hops": hops,
+    }
+
+
+def run_member_ingest_after_merge(run_tag: str | None = None) -> dict:
+    """验收夹具：并段成功后再打成员装载，主单投影应不变。
+
+    步骤：
+    1) 跑成功合并夹具（主单 + 两段成员）；
+    2) 记录主单投影快照与成员关闸核证；
+    3) 按 member_ingest_after_merge 夹具向已并入成员段装载新点；
+    4) 复核主单投影逐字段不变、成员关闸核证仍全部成立、成员新点未落正式轴。
+
+    返回证明：合并批次、主单投影前后、装载报告、装载前后关闸核证。
+    """
+    from app.services import ingest as ingest_svc
+
+    tag = run_tag or uuid.uuid4().hex[:6]
+    proof = run_fixture("success", run_tag=tag)
+    master_id = proof["fixture"]["master_id"]
+    member_ids = proof["fixture"]["member_ids"]
+
+    conn = connect()
+    try:
+        master_before = projection.snapshot(conn, master_id)
+        gates_before = {mid: verify_member_gate(conn, mid) for mid in member_ids}
+    finally:
+        conn.close()
+
+    payload = _post_merge_ingest_payload(tag, member_ids)
+    ingest_report = ingest_svc.run_batch(payload)
+
+    conn = connect()
+    try:
+        master_after = projection.snapshot(conn, master_id)
+        gates_after = {mid: verify_member_gate(conn, mid) for mid in member_ids}
+        member_hops = {
+            mid: [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT id FROM hops
+                    WHERE waybill_id=? AND channel='primary' AND retracted=0
+                    """,
+                    (mid,),
+                ).fetchall()
+            ]
+            for mid in member_ids
+        }
+    finally:
+        conn.close()
+
+    unchanged = master_before == master_after
+    gates_ok = all(
+        (gates_after[mid] or {}).get("ok") for mid in member_ids
+    ) and all(gates_before[mid] == gates_after[mid] for mid in member_ids)
+    return {
+        "ok": bool(ingest_report.get("ok")) and unchanged and gates_ok,
+        "run_tag": tag,
+        "batch_id": proof["batch_id"],
+        "master_id": master_id,
+        "member_ids": member_ids,
+        "master_projection_before": master_before,
+        "master_projection_after": master_after,
+        "master_projection_unchanged": unchanged,
+        "ingest_report": ingest_report,
+        "member_gate_before": gates_before,
+        "member_gate_after": gates_after,
+        "member_gates_ok": gates_ok,
+        "member_hops": member_hops,
+        "merge_proof": proof,
+    }
+
+
 def _insert_fixture_waybill(conn, tpl: dict, wid: str, tag: str) -> None:
     conn.execute(
         "INSERT INTO waybills(id, title, status_proj, created_at) VALUES (?,?,?,?)",
@@ -498,4 +806,10 @@ def _insert_fixture_waybill(conn, tpl: dict, wid: str, tag: str) -> None:
         )
 
 def apply_member_ingest_to_master(conn, member_id: str, master_id: str, proj: str) -> None:
-    conn.execute("UPDATE waybills SET status_proj=? WHERE id=?", (proj, master_id))
+    """历史遗留的成员 → 主单投影桥，已废弃：一律拒绝。
+
+    硬约束「禁止成员段装载改主单投影」：成员关闸后，主单投影只由主单正式轴派生，
+    任何经成员键直写主单 status_proj 的路径都必须失败，而不是静默生效。
+    """
+    raise MemberGateClosed(member_id, master_id)
+

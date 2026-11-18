@@ -7,15 +7,17 @@ from app.modules import merge_leg_proof as merge_svc
 from app.services import projection
 
 
-def run_batch() -> dict:
+def run_batch(payload: dict | None = None) -> dict:
     """基座装载：按夹具追加；乱序重排 / 旁路 / 重复隔离留给功能题空桩。
 
     已合并成员段视为冻结：其新点不再落正式线、不再改主单投影。
+    传入 payload 时按内存批次装载（夹具 runner / 验收用），否则读 ingest_batch.json。
     """
-    path = FIXTURES_DIR / "ingest_batch.json"
-    if not path.exists():
-        return {"ok": False, "error": "缺少 ingest_batch.json"}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload is None:
+        path = FIXTURES_DIR / "ingest_batch.json"
+        if not path.exists():
+            return {"ok": False, "error": "缺少 ingest_batch.json"}
+        payload = json.loads(path.read_text(encoding="utf-8"))
     batch_id = payload.get("batch_id") or f"B-{uuid.uuid4().hex[:8]}"
     cutoff = payload.get("cutoff_ts")
     hops = payload.get("hops", [])
@@ -28,7 +30,9 @@ def run_batch() -> dict:
         touched: set[str] = set()
         for hop in hops:
             wid = hop["waybill_id"]
-            if merge_svc.timeline_owner(conn, wid) != wid:
+            # 成员关闸即冻结：已并入成员段的新点不落正式线、不改主单投影，
+            # 也不允许经成员自身键重算投影（否则主单投影源证明会被成员状态带偏）。
+            if merge_svc.timeline_owner(conn, wid) != wid or merge_svc.member_gate(conn, wid):
                 skipped_merged.append(wid)
                 continue
             exists = conn.execute("SELECT 1 FROM waybills WHERE id=?", (wid,)).fetchone()

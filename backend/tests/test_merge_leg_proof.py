@@ -305,3 +305,243 @@ def test_colliding_member_point_rejected_cleanly(env):
         "SELECT merged_into FROM waybills WHERE id='WB-C1'"
     ).fetchone()["merged_into"] is None
     conn.close()
+
+
+# ---------------------------------------------------------------- 成员关闸
+
+
+def test_member_gate_proof_written_in_same_transaction(env):
+    """并段成功同事务写关闸证明；成员标记与关闸凭据同批次同主单。"""
+    proof = _run_fixture("success", "gate")
+    master = proof["fixture"]["master_id"]
+    members = proof["fixture"]["member_ids"]
+
+    conn = connect()
+    gates = merge_svc.list_member_gates(conn, master_id=master)
+    conn.close()
+
+    assert len(gates) == len(members)
+    assert {g["member_id"] for g in gates} == set(members)
+    for g in gates:
+        assert g["master_id"] == master
+        assert g["gate_state"] == "closed"
+        assert g["batch_id"] == proof["batch_id"]
+        assert g["frozen_hop_count"] == 2
+        assert g["frozen_last_hop_id"]
+        assert g["frozen_proj"]
+        # 成员关闸证明出现在批次证明里，与成员列表同源。
+    by_member = {m["id"]: m for m in proof["members"]}
+    for mid in members:
+        assert by_member[mid]["gate_state"] == "closed"
+        assert by_member[mid]["gate_proof"]["batch_id"] == proof["batch_id"]
+        assert by_member[mid]["merged_into"] == master
+
+
+def test_failed_merge_leaves_no_gate(env):
+    """失败闭：关闸证明与边 / 并入点 / 投影一并零残留。"""
+    proof = _run_fixture("failure", "gatebad")
+    members = proof["fixture"]["member_ids"]
+
+    conn = connect()
+    for mid in members:
+        assert merge_svc.member_gate(conn, mid) is None
+        assert conn.execute(
+            "SELECT merged_into FROM waybills WHERE id=?", (mid,)
+        ).fetchone()["merged_into"] is None
+        assert merge_svc.verify_member_gate(conn, mid) is None
+    conn.close()
+
+
+def test_member_gate_blocks_independent_projection_write(env):
+    """关闸后成员键不得再独立重算投影；放行前主单投影保持不变。"""
+    from app.modules.merge_leg_proof import MemberGateClosed
+    from app.services import projection
+
+    proof = _run_fixture("success", "block")
+    master = proof["fixture"]["master_id"]
+    member = proof["fixture"]["member_ids"][0]
+
+    conn = connect()
+    before = conn.execute(
+        "SELECT status_proj FROM waybills WHERE id=?", (master,)
+    ).fetchone()["status_proj"]
+
+    # 直接改成员状态（模拟「成员仍作独立有效轴」的越界改写）后，再经成员键重算投影。
+    conn.execute(
+        "UPDATE waybills SET status_proj='异常' WHERE id=?", (member,)
+    )
+    with pytest.raises(MemberGateClosed):
+        projection.recompute(conn, member, write_proof=False)
+    conn.rollback()
+
+    after = conn.execute(
+        "SELECT status_proj FROM waybills WHERE id=?", (master,)
+    ).fetchone()["status_proj"]
+    conn.close()
+    assert before == after
+
+
+def test_merge_bridge_write_path_rejects_member_projection(env):
+    """遗留成员 → 主单投影桥必须拒绝，而不是静默改主单投影。"""
+    from app.modules.merge_leg_proof import MemberGateClosed, apply_member_ingest_to_master
+
+    proof = _run_fixture("success", "bridge")
+    master = proof["fixture"]["master_id"]
+    member = proof["fixture"]["member_ids"][0]
+
+    conn = connect()
+    with pytest.raises(MemberGateClosed):
+        apply_member_ingest_to_master(conn, member, master, "异常")
+    conn.close()
+
+
+def test_member_gate_verify_clean_after_merge(env):
+    """核证接口：关闸后投影 / 证明 / 正式轴 / 主单投影源全部同源。"""
+    proof = _run_fixture("success", "verify")
+    master = proof["fixture"]["master_id"]
+
+    conn = connect()
+    for mid in proof["fixture"]["member_ids"]:
+        result = merge_svc.verify_member_gate(conn, mid)
+        assert result["ok"] is True
+        assert result["member_timeline_owner"] == master
+        assert all(result["checks"].values()), result["checks"]
+        assert result["master_status_proj"] == result["expected_master_status_proj"]
+    conn.close()
+
+
+def test_member_gate_verify_detects_torn_projection(env):
+    """核证能识别「已并入标记可见而成员仍独立改投影」的分叉。"""
+    proof = _run_fixture("success", "torn")
+    member = proof["fixture"]["member_ids"][0]
+
+    conn = connect()
+    conn.execute("UPDATE waybills SET status_proj='异常' WHERE id=?", (member,))
+    conn.commit()
+    result = merge_svc.verify_member_gate(conn, member)
+    conn.close()
+
+    assert result["ok"] is False
+    assert result["checks"]["projection_untorn"] is False
+    assert result["checks"]["gate_closed"] is True
+
+
+def test_fixture_member_ingest_after_merge_keeps_master_projection(env):
+    """夹具：并段成功后再打成员装载，主单投影应不变。
+
+    即便绕过装载服务的冻结判断、直接向成员段写入新正式点并尝试重算，
+    成员关闸也会拒绝独立投影写口，主单投影与成员关闸核证保持不变。
+    """
+    from app.modules.merge_leg_proof import MemberGateClosed
+    from app.services import projection
+
+    proof = _run_fixture("success", "postingest")
+    master = proof["fixture"]["master_id"]
+    member = proof["fixture"]["member_ids"][1]
+
+    conn = connect()
+    master_before = projection.snapshot(conn, master)
+    gate_before = merge_svc.verify_member_gate(conn, member)
+
+    conn.execute(
+        """
+        INSERT INTO hops(id, waybill_id, event_ts, location_code, event_code, seq, channel)
+        VALUES (?,?,?,?,?,?,'primary')
+        """,
+        ("LATE-MEM", member, "2026-11-18T09:00:00Z", "SHA-LATE", "EXCEPTION", 99),
+    )
+    with pytest.raises(MemberGateClosed):
+        projection.recompute(conn, member, write_proof=False)
+    conn.rollback()
+
+    master_after = projection.snapshot(conn, master)
+    gate_after = merge_svc.verify_member_gate(conn, member)
+    conn.close()
+
+    assert master_before == master_after
+    assert gate_after["ok"] is True
+    assert gate_after["checks"] == gate_before["checks"]
+
+
+def test_ingest_after_merge_skips_member_and_master_unchanged(env):
+    """装载服务路径：并段后再打成员装载被冻结，主单投影不变。"""
+    proof = _run_fixture("success", "ingest2")
+    master = proof["fixture"]["master_id"]
+    member = proof["fixture"]["member_ids"][0]
+
+    import app.services.ingest as ingest_mod
+
+    orig = ingest_mod.FIXTURES_DIR
+    fake = Path("/tmp/_ingest_gate.json")
+    fake.write_text(
+        json.dumps(
+            {
+                "batch_id": "B-GATE",
+                "hops": [
+                    {
+                        "id": "GATE-NEW",
+                        "waybill_id": member,
+                        "event_ts": "2026-11-18T10:00:00Z",
+                        "location_code": "Z",
+                        "event_code": "EXCEPTION",
+                        "seq": 9,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeDir:
+        def __truediv__(self, other):
+            return fake
+
+    ingest_mod.FIXTURES_DIR = FakeDir()
+    try:
+        result = ingest_svc.run_batch()
+    finally:
+        ingest_mod.FIXTURES_DIR = orig
+        fake.unlink(missing_ok=True)
+
+    assert result["ok"] is True
+    assert result["report"]["written"] == 0
+    assert result["report"]["skipped_merged_member"] == [member]
+
+    conn = connect()
+    wb = conn.execute(
+        "SELECT status_proj FROM waybills WHERE id=?", (master,)
+    ).fetchone()
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM hops WHERE id='GATE-NEW'"
+    ).fetchone()["c"] == 0
+    gate = merge_svc.verify_member_gate(conn, member)
+    conn.close()
+    assert wb["status_proj"] == "已签收"
+    assert gate["ok"] is True
+
+
+def test_acceptance_fixture_member_ingest_after_merge_master_unchanged(env):
+    """验收夹具：并段成功后再打成员装载，主单投影应不变。"""
+    result = merge_svc.run_member_ingest_after_merge(run_tag="acc")
+    assert result["ok"] is True
+    assert result["master_projection_unchanged"] is True
+    assert result["master_projection_before"] == result["master_projection_after"]
+    assert result["master_projection_after"]["status_proj"] == "已签收"
+    assert result["ingest_report"]["ok"] is True
+    assert result["ingest_report"]["report"]["written"] == 0
+    assert result["ingest_report"]["report"]["skipped_merged_member"] == [
+        result["member_ids"][0]
+    ]
+    assert result["member_gates_ok"] is True
+
+    conn = connect()
+    # 成员新点没有落正式轴。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM hops WHERE id LIKE 'PM-1-acc%'"
+    ).fetchone()["c"] == 0
+    # 主单时间线里也没有成员新点的副本。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM hops WHERE waybill_id=? AND location_code='SHA-LATE'",
+        (result["master_id"],),
+    ).fetchone()["c"] == 0
+    conn.close()

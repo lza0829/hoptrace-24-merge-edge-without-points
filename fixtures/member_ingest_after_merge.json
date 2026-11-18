@@ -1,0 +1,14 @@
+{
+  "batch_id_prefix": "B-POSTMERGE",
+  "member_index": 0,
+  "hops": [
+    {
+      "id": "PM-1",
+      "waybill_title": "并段后成员装载样本",
+      "event_ts": "2026-11-18T09:00:00Z",
+      "location_code": "SHA-LATE",
+      "event_code": "EXCEPTION",
+      "seq": 99
+    }
+  ]
+}

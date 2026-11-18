@@ -124,10 +124,12 @@ def run_merge(req: MergeRequest):
 
 @router.post("/merge/fixture")
 def run_merge_fixture(mode: str = "success"):
-    """装载合并夹具并跑一次合并；mode=success|failure 用于成功 / 回滚对照。"""
-    if mode not in ("success", "failure"):
-        raise HTTPException(400, "mode 仅支持 success / failure")
+    """装载合并夹具并跑一次合并；mode=success|failure|member_ingest 对照。"""
+    if mode not in ("success", "failure", "member_ingest"):
+        raise HTTPException(400, "mode 仅支持 success / failure / member_ingest")
     try:
+        if mode == "member_ingest":
+            return merge_svc.run_member_ingest_after_merge()
         return merge_svc.run_fixture(mode)
     except merge_svc.MergeError as e:
         raise HTTPException(400, str(e)) from e
@@ -151,5 +153,34 @@ def merge_batch_proof(batch_id: str):
         if not proof:
             raise HTTPException(404, "合并批次不存在")
         return proof
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 成员关闸核证
+
+
+@router.get("/merge/member-gates")
+def merge_member_gates(master_id: str | None = None, limit: int = 100):
+    """成员关闸证明列表（只读），可按主单过滤。"""
+    conn = connect()
+    try:
+        return merge_svc.list_member_gates(conn, master_id=master_id, limit=limit)
+    finally:
+        conn.close()
+
+
+@router.get("/merge/member-gates/{member_id}")
+def merge_member_gate_verify(member_id: str):
+    """成员关闸核证（只读）：关闸凭据 + 投影 / 证明 / 正式轴未撕裂 + 主单投影同源。
+
+    未关闸的成员返回 404；核证不通过 ok=False，仍返回 200 供页面展示分叉项。
+    """
+    conn = connect()
+    try:
+        result = merge_svc.verify_member_gate(conn, member_id)
+        if not result:
+            raise HTTPException(404, "成员段未关闸")
+        return result
     finally:
         conn.close()

@@ -5,11 +5,16 @@ import { api } from '../api.js'
 const batches = ref([])
 const selected = ref(null)
 const proof = ref(null)
+const gateChecks = ref([])
+const acceptance = ref(null)
 const busy = ref('')
 const err = ref('')
 const lastMode = ref('')
 
 const committed = computed(() => proof.value?.status === 'committed')
+const gatesOk = computed(
+  () => gateChecks.value.length > 0 && gateChecks.value.every((g) => g.ok)
+)
 const delta = computed(() => {
   if (!proof.value) return null
   const b = proof.value.projection_before || {}
@@ -21,9 +26,17 @@ async function loadBatches() {
   batches.value = await api.mergeBatches()
 }
 
+async function loadGates(p) {
+  gateChecks.value = []
+  if (p?.status !== 'committed') return
+  const ids = (p.members || []).map((m) => m.id)
+  gateChecks.value = await Promise.all(ids.map((id) => api.mergeMemberGate(id)))
+}
+
 async function openBatch(id) {
   selected.value = id
   proof.value = await api.mergeBatch(id)
+  await loadGates(proof.value)
 }
 
 async function runFixture(mode) {
@@ -32,8 +45,18 @@ async function runFixture(mode) {
   try {
     const result = await api.mergeFixture(mode)
     lastMode.value = mode
-    proof.value = result
-    selected.value = result.batch_id
+    if (mode === 'member_ingest') {
+      // 验收夹具返回装载前后对照；证明面板回到其包含的合并批次。
+      acceptance.value = result
+      proof.value = result.merge_proof
+      selected.value = result.batch_id
+      await loadGates(result.merge_proof)
+    } else {
+      acceptance.value = null
+      proof.value = result
+      selected.value = result.batch_id
+      await loadGates(result)
+    }
     await loadBatches()
   } catch (e) {
     err.value = String(e.message || e)
@@ -56,7 +79,8 @@ onMounted(async () => {
   <div class="page-card merge-page">
     <h1>并单</h1>
     <p class="lead">
-      成员段正式点按 (event_ts, id) 并入主单正式时间线。同事务写点 + 写边 + 重算投影，任一步失败整笔回滚。
+      成员段正式点按 (event_ts, id) 并入主单正式时间线。同事务写点 + 写边 + 关成员闸 + 重算主单投影，
+      任一步失败整笔回滚。关闸后成员段不得再经自身键独立改投影。
     </p>
 
     <div class="merge-actions">
@@ -66,8 +90,40 @@ onMounted(async () => {
       <button class="btn btn-ghost" :disabled="!!busy" @click="runFixture('failure')">
         {{ busy === 'failure' ? '回滚中…' : '跑中途失败夹具（对照）' }}
       </button>
+      <button class="btn btn-ghost" :disabled="!!busy" @click="runFixture('member_ingest')">
+        {{ busy === 'member_ingest' ? '复核中…' : '并段后打成员装载（验收）' }}
+      </button>
     </div>
     <p v-if="err" class="muted" style="margin-top:12px">{{ err }}</p>
+
+    <section v-if="acceptance" class="acceptance-pane">
+      <h2>并段后成员装载验收</h2>
+      <p class="muted">
+        夹具：并段成功后再打成员装载，主单投影应不变。
+      </p>
+      <div class="stat-row">
+        <div class="stat">
+          <b>{{ acceptance.master_projection_before?.status_proj }} → {{ acceptance.master_projection_after?.status_proj }}</b>
+          <span>主单投影前后</span>
+        </div>
+        <div class="stat">
+          <b>{{ acceptance.master_projection_unchanged ? '未变' : '已漂移' }}</b>
+          <span>主单投影</span>
+        </div>
+        <div class="stat">
+          <b>{{ acceptance.ingest_report?.report?.written }}</b>
+          <span>成员新点写入</span>
+        </div>
+        <div class="stat">
+          <b>{{ acceptance.member_gates_ok ? '一致' : '分叉' }}</b>
+          <span>成员关闸核证</span>
+        </div>
+      </div>
+      <p class="muted">
+        装载报告：跳过的已并入成员 {{ acceptance.ingest_report?.report?.skipped_merged_member?.join('、') || '—' }}。
+        主单投影只由主单正式轴派生，成员装载不改主单投影。
+      </p>
+    </section>
 
     <div class="merge-grid">
       <aside class="batch-list">
@@ -114,7 +170,7 @@ onMounted(async () => {
         <h3>成员段</h3>
         <table class="table">
           <thead>
-            <tr><th>成员</th><th>标题</th><th>并入点数</th><th>归属主单</th></tr>
+            <tr><th>成员</th><th>标题</th><th>并入点数</th><th>归属主单</th><th>独立投影写口</th></tr>
           </thead>
           <tbody>
             <tr v-for="m in proof.members" :key="m.id">
@@ -122,9 +178,41 @@ onMounted(async () => {
               <td>{{ m.title }}</td>
               <td>{{ m.merged_count }}</td>
               <td>{{ m.merged_into || '—' }}</td>
+              <td>
+                <span class="tag" :class="m.gate_state === 'closed' ? 'ok' : 'bad'">
+                  {{ m.gate_state === 'closed' ? '已关闸' : '开放' }}
+                </span>
+              </td>
             </tr>
           </tbody>
         </table>
+
+        <template v-if="committed && gateChecks.length">
+          <h3>成员关闸核证</h3>
+          <table class="table gate-table">
+            <thead>
+              <tr>
+                <th>成员</th><th>关闸</th><th>投影未裂</th><th>证明未裂</th>
+                <th>正式轴未裂</th><th>归属一致</th><th>主单同源</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="g in gateChecks" :key="g.member_id">
+                <td>{{ g.member_id }}</td>
+                <td><span class="tag" :class="g.checks.gate_closed ? 'ok' : 'bad'">{{ g.checks.gate_closed ? '是' : '否' }}</span></td>
+                <td><span class="tag" :class="g.checks.projection_untorn ? 'ok' : 'bad'">{{ g.checks.projection_untorn ? '是' : '否' }}</span></td>
+                <td><span class="tag" :class="g.checks.proof_untorn ? 'ok' : 'bad'">{{ g.checks.proof_untorn ? '是' : '否' }}</span></td>
+                <td><span class="tag" :class="g.checks.hops_untorn ? 'ok' : 'bad'">{{ g.checks.hops_untorn ? '是' : '否' }}</span></td>
+                <td><span class="tag" :class="g.checks.merged_into_matches ? 'ok' : 'bad'">{{ g.checks.merged_into_matches ? '是' : '否' }}</span></td>
+                <td><span class="tag" :class="g.checks.master_projection_from_timeline ? 'ok' : 'bad'">{{ g.checks.master_projection_from_timeline ? '是' : '否' }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="muted">
+            主单投影只由主单正式轴派生：{{ proof.master?.status_proj }} ·
+            {{ gatesOk ? '成员关闸全部一致' : '存在成员关闸分叉' }}
+          </p>
+        </template>
 
         <h3>前后投影</h3>
         <div class="proj-pair">
